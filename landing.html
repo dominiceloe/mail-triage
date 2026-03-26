@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>mail-triage — Clean your inbox in minutes</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', sans-serif; background: #f9fafb; color: #1f2937; }
+    .container { max-width: 600px; margin: 0 auto; padding: 80px 24px 48px; text-align: center; }
+    h1 { font-size: 2rem; font-weight: 700; color: #2563eb; margin-bottom: 12px; }
+    .tagline { font-size: 1.15rem; color: #6b7280; margin-bottom: 40px; line-height: 1.6; }
+    .cta {
+      display: inline-block; padding: 14px 40px;
+      background: #2563eb; color: #fff; font-size: 1rem; font-weight: 600;
+      border-radius: 8px; text-decoration: none;
+      transition: background 0.15s;
+    }
+    .cta:hover { background: #1d4ed8; }
+    .features { text-align: left; margin: 48px 0; }
+    .features h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; }
+    .features ul { list-style: none; padding: 0; }
+    .features li { padding: 8px 0; color: #374151; line-height: 1.5; }
+    .features li::before { content: "✓ "; color: #16a34a; font-weight: 600; }
+    .privacy-box {
+      margin-top: 48px; padding: 20px;
+      background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+      text-align: left;
+    }
+    .privacy-box p { color: #374151; line-height: 1.6; font-size: 0.95rem; }
+    .privacy-box strong { color: #1f2937; }
+    footer { margin-top: 48px; color: #9ca3af; font-size: 0.85rem; }
+    footer a { color: #9ca3af; text-decoration: underline; }
+    footer a:hover { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>mail-triage</h1>
+    <p class="tagline">Bulk-archive the noise in your Gmail inbox.<br>No install. No server. No cost.</p>
+    <a href="./index.html" class="cta">Open mail-triage</a>
+
+    <div class="features">
+      <h2>How it works</h2>
+      <ul>
+        <li>Sign in with Google</li>
+        <li>See your inbox stats — unread count, estimated noise</li>
+        <li>Pick which categories to archive: promotions, social, updates, forums, no-reply senders</li>
+        <li>Preview exactly what will be archived, with counts per rule</li>
+        <li>Confirm and watch it run in real time</li>
+        <li>Nothing is ever deleted — archive only, always reversible</li>
+      </ul>
+    </div>
+
+    <div class="privacy-box">
+      <p><strong>Your emails never leave your browser.</strong> mail-triage runs entirely client-side. No data is sent to any server — not ours, not anyone's. No analytics, no tracking, no third parties.</p>
+      <p style="margin-top: 12px;"><a href="./privacy.html" style="color: #2563eb;">Read the full Privacy Policy</a></p>
+    </div>
+
+    <footer>
+      <a href="./privacy.html">Privacy Policy</a>
+    </footer>
+  </div>
+</body>
+</html>
