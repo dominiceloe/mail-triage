@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>mail-triage</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@mui/material@5/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://apis.google.com/js/api.js" async defer></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', sans-serif; background: #f9fafb; }
+
+    /* Loading screen */
+    #loading-screen {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #fff;
+      transition: opacity 0.4s ease;
+    }
+    #loading-screen.fade-out { opacity: 0; pointer-events: none; }
+    #loading-screen h1 {
+      font-family: 'Inter', sans-serif;
+      font-size: 2rem; font-weight: 700;
+      color: #2563eb; margin-bottom: 24px;
+    }
+    .spinner {
+      width: 32px; height: 32px;
+      border: 3px solid #e5e7eb;
+      border-top-color: #2563eb;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Root fade-in */
+    #root { opacity: 0; transition: opacity 0.4s ease; }
+    #root.fade-in { opacity: 1; }
+
+    /* Step transitions */
+    .step-container {
+      transition: opacity 0.2s ease;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading-screen">
+    <h1>mail-triage</h1>
+    <div class="spinner"></div>
+  </div>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // ─── CONFIG ───────────────────────────────────────────────
+    const CONFIG = {
+      CLIENT_ID: '341562855845-21075pmo1bk6itansoc5qejnpc9vkupe.apps.googleusercontent.com',
+    };
+
+    const SCOPES = 'https://www.googleapis.com/auth/gmail.modify';
+
+    // ─── MUI Setup ───────────────────────────────────────────
+    const {
+      ThemeProvider, createTheme, CssBaseline,
+      Box, Card, CardContent, Typography, Button, Paper,
+      Switch, List, ListItem, ListItemText, ListItemSecondaryAction,
+      LinearProgress, Table, TableBody, TableRow, TableCell,
+      Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
+      Alert, Accordion, AccordionSummary, AccordionDetails, TextField,
+      Divider, Fade,
+    } = MaterialUI;
+
+    const theme = createTheme({
+      typography: { fontFamily: 'Inter, sans-serif' },
+      palette: {
+        background: { default: '#f9fafb' },
+        primary: { main: '#2563eb' },
+        error: { main: '#dc2626' },
+        success: { main: '#16a34a' },
+      },
+      shape: { borderRadius: 12 },
+    });
+
+    // ─── Gmail API Utilities ─────────────────────────────────
+    const QUERIES = {
+      promotions:  'is:unread in:inbox category:promotions',
+      social:      'is:unread in:inbox category:social',
+      updates:     'is:unread in:inbox category:updates',
+      forums:      'is:unread in:inbox category:forums',
+      noreply:     'is:unread in:inbox from:(noreply OR no-reply OR donotreply OR do-not-reply OR mailer-daemon)',
+      unsubscribe: 'is:unread in:inbox list:""',
+      olderThan:   null,
+      ccOnly:      null,
+    };
+
+    function formatDate(d) {
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return `${yyyy}/${mm}/${dd}`;
+    }
+
+    function formatNumber(n) {
+      return Number(n).toLocaleString();
+    }
+
+    let tokenClient = null;
+    let accessToken = null;
+    let userEmail = '';
+
+    function initGapi() {
+      return new Promise((resolve) => {
+        const check = () => {
+          if (typeof gapi !== 'undefined') {
+            gapi.load('client', async () => {
+              await gapi.client.init({
+                discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest'],
+              });
+              resolve();
+            });
+          } else {
+            setTimeout(check, 100);
+          }
+        };
+        check();
+      });
+    }
+
+    async function getProfile() {
+      const res = await gapi.client.gmail.users.getProfile({ userId: 'me' });
+      userEmail = res.result.emailAddress;
+      return res.result;
+    }
+
+    async function getLabelUnreadCount(labelId) {
+      const res = await gapi.client.gmail.users.labels.get({
+        userId: 'me', id: labelId,
+      });
+      return res.result.messagesUnread || 0;
+    }
+
+    async function getPaginatedCount(query, cap = 10000) {
+      let count = 0;
+      let pageToken = null;
+      do {
+        const params = { userId: 'me', q: query, maxResults: 500, fields: 'nextPageToken,messages/id' };
+        if (pageToken) params.pageToken = pageToken;
+        const res = await gapi.client.gmail.users.messages.list(params);
+        count += (res.result.messages || []).length;
+        pageToken = res.result.nextPageToken;
+      } while (pageToken && count < cap);
+      return Math.min(count, cap);
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    async function archiveBatch(messageIds, markRead) {
+      const removeLabelIds = ['INBOX'];
+      if (markRead) removeLabelIds.push('UNREAD');
+      return gapi.client.request({
+        path: 'https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify',
+        method: 'POST',
+        body: JSON.stringify({ ids: messageIds, removeLabelIds }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ─── React Components ────────────────────────────────────
+
+    // State 2: Auth Screen
+    function AuthScreen({ onSignIn }) {
+      return (
+        <Box sx={{ textAlign: 'center', py: 4 }}>
+          <Typography variant="h4" sx={{ fontWeight: 700, color: 'primary.main', mb: 1 }}>
+            mail-triage
+          </Typography>
+          <Typography variant="subtitle1" color="text.secondary" sx={{ mb: 4 }}>
+            Your inbox is a backlog. Let's triage it.
+          </Typography>
+          <Button
+            variant="outlined"
+            size="large"
+            onClick={onSignIn}
+            sx={{
+              mb: 3, px: 4, py: 1.5, textTransform: 'none',
+              fontSize: '1rem', borderColor: '#dadce0', color: '#3c4043',
+              '&:hover': { borderColor: '#dadce0', bgcolor: '#f8f9fa' },
+            }}
+          >
+            Sign in with Google
+          </Button>
+          <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
+            Runs entirely in your browser. Your emails never leave your machine.
+          </Typography>
+        </Box>
+      );
+    }
+
+    // State 3: Stats Screen
+    function StatsScreen({ stats, onContinue }) {
+      const cards = [
+        { label: 'Total Unread', value: formatNumber(stats.totalUnread) },
+        { label: 'Estimated Noise', value: `~${Math.round(stats.noiseRate * 100)}%` },
+        { label: 'Needs Attention', value: `~${formatNumber(stats.needsAttention)}` },
+      ];
+
+      return (
+        <Box sx={{ py: 3 }}>
+          <Typography variant="h5" sx={{ fontWeight: 600, mb: 3, textAlign: 'center' }}>
+            Your Inbox
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 2, mb: 1 }}>
+            {cards.map((c, i) => (
+              <Paper key={i} elevation={0} sx={{ flex: 1, p: 2.5, textAlign: 'center', border: '1px solid #e5e7eb' }}>
+                <Typography variant="h4" sx={{ fontWeight: 700, mb: 0.5 }}>
+                  {c.value}
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {c.label}
+                </Typography>
+              </Paper>
+            ))}
+          </Box>
+          <Typography variant="caption" color="text.disabled" sx={{ display: 'block', textAlign: 'center', mb: 3 }}>
+            (estimated)
+          </Typography>
+          <Button variant="contained" color="primary" fullWidth size="large" onClick={onContinue}>
+            CONFIGURE RULES &rarr;
+          </Button>
+        </Box>
+      );
+    }
+
+    // State 4: Configure Screen
+    function ConfigureScreen({ rules, setRules, cutoffDate, setCutoffDate, onPreview }) {
+      const standardRules = [
+        { key: 'promotions', label: 'Promotions', secondary: 'Marketing emails, deals, offers' },
+        { key: 'social', label: 'Social', secondary: 'LinkedIn, Twitter, Facebook notifications' },
+        { key: 'updates', label: 'Updates', secondary: 'Shipping confirmations, receipts, automated updates' },
+        { key: 'forums', label: 'Forums', secondary: 'Mailing lists and group discussions' },
+        { key: 'noreply', label: 'No-reply senders', secondary: "Emails from addresses you can't reply to" },
+        { key: 'unsubscribe', label: 'Unsubscribe links', secondary: 'Emails containing unsubscribe links' },
+      ];
+
+      const toggle = (key) => setRules(prev => ({ ...prev, [key]: !prev[key] }));
+
+      return (
+        <Box sx={{ py: 2 }}>
+          <Typography variant="h5" sx={{ fontWeight: 600, mb: 0.5 }}>
+            Choose what to archive
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Review and adjust the rules below. Nothing will be archived until you confirm.
+          </Typography>
+
+          <List disablePadding>
+            {standardRules.map((r) => (
+              <ListItem key={r.key} sx={{ px: 0 }}>
+                <ListItemText primary={r.label} secondary={r.secondary} />
+                <ListItemSecondaryAction>
+                  <Switch checked={rules[r.key]} onChange={() => toggle(r.key)} color="primary" />
+                </ListItemSecondaryAction>
+              </ListItem>
+            ))}
+
+            <Divider sx={{ my: 1 }} />
+
+            <ListItem sx={{ px: 0 }}>
+              <ListItemText primary="Only older emails" secondary="Only archive emails before a specific date" />
+              <ListItemSecondaryAction>
+                <Switch checked={rules.olderThan} onChange={() => toggle('olderThan')} color="primary" />
+              </ListItemSecondaryAction>
+            </ListItem>
+          </List>
+
+          {rules.olderThan && (
+            <Box sx={{ ml: 2, mb: 2, mt: 1 }}>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                Only archive emails older than:
+              </Typography>
+              <TextField
+                type="date"
+                size="small"
+                value={cutoffDate}
+                onChange={(e) => setCutoffDate(e.target.value)}
+                sx={{ width: 220 }}
+              />
+            </Box>
+          )}
+
+          <Accordion elevation={0} sx={{ border: '1px solid #e5e7eb', mt: 2, '&:before': { display: 'none' } }}>
+            <AccordionSummary expandIcon={<span style={{ fontSize: 14 }}>&#9660;</span>}>
+              <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                &#9881; Advanced
+              </Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
+                <ListItemText
+                  sx={{ flex: 1 }}
+                  primary="CC'd not TO'd"
+                  secondary={
+                    <React.Fragment>
+                      Archive emails where you're CC'd but not the primary recipient.
+                      <Typography component="span" variant="caption" color="warning.main" sx={{ whiteSpace: 'nowrap' }}>
+                        {' '}&#9888;{'\u00A0'}Review carefully — may include important threads.
+                      </Typography>
+                    </React.Fragment>
+                  }
+                />
+                <Switch checked={rules.ccOnly} onChange={() => toggle('ccOnly')} color="primary" sx={{ mt: 0.5, flexShrink: 0 }} />
+              </Box>
+              <Divider sx={{ my: 1 }} />
+              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
+                <ListItemText
+                  sx={{ flex: 1 }}
+                  primary="Mark as read"
+                  secondary="Also mark archived emails as read. Reduces your unread count but removes the unread indicator if you search for them later."
+                />
+                <Switch checked={rules.markRead} onChange={() => toggle('markRead')} color="primary" sx={{ mt: 0.5, flexShrink: 0 }} />
+              </Box>
+            </AccordionDetails>
+          </Accordion>
+
+          <Button variant="contained" color="primary" fullWidth size="large" sx={{ mt: 3 }} onClick={onPreview}>
+            PREVIEW RESULTS &rarr;
+          </Button>
+        </Box>
+      );
+    }
+
+    // State 5: Preview Screen
+    function PreviewScreen({ counts, totalCount, rules, cutoffDate, onBack, onArchive }) {
+      const ruleLabels = {
+        promotions: 'Promotions',
+        social: 'Social notifications',
+        updates: 'Updates & confirmations',
+        forums: 'Forums & mailing lists',
+        noreply: 'No-reply senders',
+        unsubscribe: 'Unsubscribe links',
+        ccOnly: "CC'd not TO'd",
+      };
+
+      const enabledRules = Object.keys(counts).filter(k => rules[k]);
+
+      return (
+        <Box sx={{ py: 2 }}>
+          <Typography variant="h5" sx={{ fontWeight: 600, mb: 0.5 }}>
+            Here's what will be archived:
+          </Typography>
+          {rules.olderThan && (
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Only emails older than {cutoffDate}
+            </Typography>
+          )}
+          {!rules.olderThan && <Box sx={{ mb: 2 }} />}
+
+          <Table size="small">
+            <TableBody>
+              {enabledRules.map(key => (
+                <TableRow key={key}>
+                  <TableCell sx={{ border: 'none', pl: 0 }}>{ruleLabels[key]}</TableCell>
+                  <TableCell align="right" sx={{ border: 'none', pr: 0 }}>{formatNumber(counts[key])}</TableCell>
+                </TableRow>
+              ))}
+              <TableRow>
+                <TableCell sx={{ borderTop: '2px solid #e5e7eb', pl: 0, pt: 2 }}>
+                  <Typography sx={{ fontWeight: 700 }}>Total</Typography>
+                </TableCell>
+                <TableCell align="right" sx={{ borderTop: '2px solid #e5e7eb', pr: 0, pt: 2 }}>
+                  <Typography sx={{ fontWeight: 700 }}>up to {formatNumber(totalCount)} emails</Typography>
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+            Duplicates across rules are automatically removed during archiving.
+          </Typography>
+
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 3, mb: 3 }}>
+            These emails will be moved to All Mail. Nothing is deleted. You can find them anytime by searching in Gmail.
+          </Typography>
+
+          <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+            <Button variant="text" onClick={onBack}>&larr; BACK</Button>
+            <Button variant="contained" color="primary" onClick={onArchive}>
+              ARCHIVE {formatNumber(totalCount)} EMAILS &rarr;
+            </Button>
+          </Box>
+        </Box>
+      );
+    }
+
+    // State 6: Confirmation Dialog
+    function ConfirmDialog({ open, totalCount, onCancel, onConfirm }) {
+      return (
+        <Dialog open={open} onClose={onCancel} maxWidth="sm" fullWidth>
+          <DialogTitle sx={{ fontWeight: 600 }}>
+            Archive {formatNumber(totalCount)} emails?
+          </DialogTitle>
+          <DialogContent>
+            <DialogContentText>
+              This will move {formatNumber(totalCount)} emails out of your inbox into All Mail. Nothing will be deleted. You can undo this manually in Gmail at any time.
+            </DialogContentText>
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
+            <Button variant="outlined" onClick={onCancel}>CANCEL</Button>
+            <Button variant="contained" color="error" onClick={onConfirm}>
+              YES, ARCHIVE {formatNumber(totalCount)} EMAILS
+            </Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    // State 7: Progress Screen
+    function ProgressScreen({ logs, progress, batchStatus }) {
+      const logEndRef = React.useRef(null);
+
+      React.useEffect(() => {
+        logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [logs]);
+
+      const logColors = {
+        info: 'text.secondary',
+        action: 'primary.main',
+        success: 'success.main',
+        error: 'error.main',
+      };
+
+      return (
+        <Box sx={{ py: 2 }}>
+          <Typography variant="h5" sx={{ fontWeight: 600, mb: 2 }}>
+            Archiving...
+          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+            <Box sx={{ flex: 1, mr: 2 }}>
+              <LinearProgress variant="determinate" value={progress} sx={{ height: 8, borderRadius: 4 }} />
+            </Box>
+            <Typography variant="body2" sx={{ fontWeight: 500, minWidth: 45 }}>
+              {Math.round(progress)}%
+            </Typography>
+          </Box>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            {batchStatus}
+          </Typography>
+          <Paper
+            variant="outlined"
+            sx={{
+              height: 300, overflow: 'auto', p: 2,
+              bgcolor: '#f9fafb', borderColor: '#e5e7eb',
+            }}
+          >
+            {logs.map((log, i) => (
+              <Typography
+                key={i}
+                variant="body2"
+                sx={{ color: logColors[log.type] || 'text.secondary', mb: 0.5 }}
+              >
+                {log.message}
+              </Typography>
+            ))}
+            <div ref={logEndRef} />
+          </Paper>
+        </Box>
+      );
+    }
+
+    // State 8: Complete Screen
+    function CompleteScreen({ archived, scanned, remaining, onRunAgain, onSignOut }) {
+      return (
+        <Box sx={{ py: 3 }}>
+          <Alert severity="success" sx={{ mb: 3, fontSize: '1rem' }}>
+            Done. {formatNumber(archived)} emails archived.
+          </Alert>
+
+          <Box sx={{ display: 'flex', gap: 2, mb: 3 }}>
+            <Paper elevation={0} sx={{ flex: 1, p: 2, textAlign: 'center', border: '1px solid #e5e7eb' }}>
+              <Typography variant="h5" sx={{ fontWeight: 700 }}>{formatNumber(scanned)}</Typography>
+              <Typography variant="body2" color="text.secondary">Emails scanned</Typography>
+            </Paper>
+            <Paper elevation={0} sx={{ flex: 1, p: 2, textAlign: 'center', border: '1px solid #e5e7eb' }}>
+              <Typography variant="h5" sx={{ fontWeight: 700 }}>{formatNumber(archived)}</Typography>
+              <Typography variant="body2" color="text.secondary">Emails archived</Typography>
+            </Paper>
+            <Paper elevation={0} sx={{ flex: 1, p: 2, textAlign: 'center', border: '1px solid #e5e7eb' }}>
+              <Typography variant="h5" sx={{ fontWeight: 700 }}>{formatNumber(remaining)}</Typography>
+              <Typography variant="body2" color="text.secondary">Remaining in inbox</Typography>
+            </Paper>
+          </Box>
+
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+            Everything is safe. Your archived emails are in Gmail's All Mail folder and can be found by searching at any time. Nothing was deleted.
+          </Typography>
+
+          <Box sx={{ display: 'flex', gap: 2, justifyContent: 'center' }}>
+            <Button variant="outlined" onClick={onRunAgain}>RUN AGAIN</Button>
+            <Button variant="text" onClick={onSignOut}>SIGN OUT</Button>
+          </Box>
+        </Box>
+      );
+    }
+
+    // ─── App State Machine ───────────────────────────────────
+    function App() {
+      const [step, setStep] = React.useState('auth');
+      const [visible, setVisible] = React.useState(true);
+      const [stats, setStats] = React.useState(null);
+      const [rules, setRules] = React.useState({
+        promotions: true, social: true, updates: true,
+        forums: true, noreply: true, unsubscribe: true,
+        olderThan: false, ccOnly: false, markRead: false,
+      });
+      const defaultCutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const [cutoffDate, setCutoffDate] = React.useState(defaultCutoff);
+      const [counts, setCounts] = React.useState({});
+      const [totalCount, setTotalCount] = React.useState(0);
+      const [showConfirm, setShowConfirm] = React.useState(false);
+      const [logs, setLogs] = React.useState([]);
+      const [progress, setProgress] = React.useState(0);
+      const [batchStatus, setBatchStatus] = React.useState('');
+      const [archiveResult, setArchiveResult] = React.useState(null);
+      const [loading, setLoading] = React.useState(false);
+      const [error, setError] = React.useState(null);
+
+      const transition = (newStep) => {
+        setVisible(false);
+        setTimeout(() => {
+          setStep(newStep);
+          setVisible(true);
+        }, 200);
+      };
+
+      const addLog = (type, message) => {
+        setLogs(prev => [...prev, { type, message }]);
+      };
+
+      // Auth handler
+      const handleSignIn = async () => {
+        setError(null);
+        try {
+          await initGapi();
+
+          await new Promise((resolve, reject) => {
+            const check = () => {
+              if (typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
+                tokenClient = google.accounts.oauth2.initTokenClient({
+                  client_id: CONFIG.CLIENT_ID,
+                  scope: SCOPES,
+                  callback: (response) => {
+                    if (response.error) {
+                      reject(new Error(response.error));
+                      return;
+                    }
+                    accessToken = response.access_token;
+                    gapi.client.setToken({ access_token: response.access_token });
+                    resolve();
+                  },
+                });
+                tokenClient.requestAccessToken();
+              } else {
+                setTimeout(check, 100);
+              }
+            };
+            check();
+          });
+
+          setLoading(true);
+
+          await getProfile();
+          const [totalUnread, noiseCount] = await Promise.all([
+            getLabelUnreadCount('INBOX'),
+            getPaginatedCount('is:unread in:inbox -category:primary', 10000),
+          ]);
+
+          const noiseRate = totalUnread > 0 ? Math.min(noiseCount / totalUnread, 1.0) : 0;
+          const needsAttention = Math.max(totalUnread - noiseCount, 0);
+
+          setStats({
+            totalUnread,
+            noiseRate,
+            needsAttention,
+          });
+
+          setLoading(false);
+          transition('stats');
+        } catch (e) {
+          setLoading(false);
+          setError('Failed to connect to Gmail. Please try again.');
+        }
+      };
+
+      // Preview handler
+      const handlePreview = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const newCounts = {};
+          let total = 0;
+
+          // Date suffix applied to all queries when date cutoff is enabled
+          const dateSuffix = rules.olderThan
+            ? ` before:${formatDate(new Date(cutoffDate))}`
+            : '';
+
+          // Category rules — use paginated search with category query + date filter
+          const categoryQueries = {
+            promotions: QUERIES.promotions,
+            social: QUERIES.social,
+            updates: QUERIES.updates,
+            forums: QUERIES.forums,
+          };
+          const categoryKeys = Object.keys(categoryQueries).filter(k => rules[k]);
+          const categoryPromises = categoryKeys.map(k =>
+            getPaginatedCount(categoryQueries[k] + dateSuffix, 50000)
+          );
+          const categoryCounts = await Promise.all(categoryPromises);
+          categoryKeys.forEach((k, i) => {
+            newCounts[k] = categoryCounts[i];
+            total += categoryCounts[i];
+          });
+
+          // Search-based rules (paginated, capped at 50k)
+          const searchRules = [];
+          if (rules.noreply) searchRules.push({ key: 'noreply', query: QUERIES.noreply + dateSuffix });
+          if (rules.unsubscribe) searchRules.push({ key: 'unsubscribe', query: QUERIES.unsubscribe + dateSuffix });
+          if (rules.ccOnly) searchRules.push({ key: 'ccOnly', query: `is:unread in:inbox -to:${userEmail}` + dateSuffix });
+
+          const searchPromises = searchRules.map(r => getPaginatedCount(r.query, 50000));
+          const searchCounts = await Promise.all(searchPromises);
+          searchRules.forEach((r, i) => {
+            newCounts[r.key] = searchCounts[i];
+            total += searchCounts[i];
+          });
+
+          setCounts(newCounts);
+          setTotalCount(total);
+          setLoading(false);
+          transition('preview');
+        } catch (e) {
+          setLoading(false);
+          setError('Failed to fetch preview counts. Please try again.');
+        }
+      };
+
+      // Archive handler
+      const handleArchive = async () => {
+        setShowConfirm(false);
+        transition('progress');
+        setLogs([]);
+        setProgress(0);
+
+        let totalArchived = 0;
+        let totalScanned = 0;
+
+        try {
+          // Collect all message IDs for enabled rules
+          const allMessageIds = new Set();
+
+          const dateSuffix = rules.olderThan
+            ? ` before:${formatDate(new Date(cutoffDate))}`
+            : '';
+
+          const archiveQueries = {};
+          if (rules.promotions) archiveQueries.promotions = QUERIES.promotions + dateSuffix;
+          if (rules.social) archiveQueries.social = QUERIES.social + dateSuffix;
+          if (rules.updates) archiveQueries.updates = QUERIES.updates + dateSuffix;
+          if (rules.forums) archiveQueries.forums = QUERIES.forums + dateSuffix;
+          if (rules.noreply) archiveQueries.noreply = QUERIES.noreply + dateSuffix;
+          if (rules.unsubscribe) archiveQueries.unsubscribe = QUERIES.unsubscribe + dateSuffix;
+          if (rules.ccOnly) archiveQueries.ccOnly = `is:unread in:inbox -to:${userEmail}` + dateSuffix;
+
+          for (const [key, query] of Object.entries(archiveQueries)) {
+            addLog('info', `Fetching messages for: ${key}...`);
+
+            let pageToken = null;
+            do {
+              const params = { userId: 'me', q: query, maxResults: 500 };
+              if (pageToken) params.pageToken = pageToken;
+              const res = await gapi.client.gmail.users.messages.list(params);
+              const messages = res.result.messages || [];
+              messages.forEach(m => allMessageIds.add(m.id));
+              totalScanned += messages.length;
+              pageToken = res.result.nextPageToken;
+            } while (pageToken);
+          }
+
+          const messageIds = Array.from(allMessageIds);
+          const totalToArchive = messageIds.length;
+          const batchSize = 1000;
+          const totalBatches = Math.ceil(totalToArchive / batchSize);
+
+          addLog('action', `\u2192 Archiving ${formatNumber(totalToArchive)} emails in ${totalBatches} batches`);
+
+          for (let i = 0; i < totalToArchive; i += batchSize) {
+            const batchNum = Math.floor(i / batchSize) + 1;
+            const batch = messageIds.slice(i, i + batchSize);
+
+            setBatchStatus(`Processing batch ${batchNum} of ${totalBatches}...`);
+            addLog('info', `Fetching batch ${batchNum} of ${totalBatches}...`);
+
+            let retries = 0;
+            let success = false;
+            while (!success && retries < 3) {
+              try {
+                await archiveBatch(batch, rules.markRead);
+                success = true;
+                addLog('action', `\u2192 Archiving ${batch.length} emails`);
+                addLog('success', '\u2713 Batch complete');
+                totalArchived += batch.length;
+              } catch (e) {
+                if (e.status === 429 || (e.result && e.result.error && e.result.error.code === 429)) {
+                  retries++;
+                  addLog('error', `\u26A0 Rate limit hit \u2014 retrying in 2s`);
+                  await sleep(2000);
+                } else {
+                  addLog('error', `\u26A0 Batch ${batchNum} failed \u2014 skipping`);
+                  success = true; // skip this batch
+                }
+              }
+            }
+
+            setProgress(((i + batch.length) / totalToArchive) * 100);
+            await sleep(200);
+          }
+
+          setProgress(100);
+          setBatchStatus('Complete!');
+          addLog('success', `\u2713 All done! ${formatNumber(totalArchived)} emails archived.`);
+
+          const remaining = await getLabelUnreadCount('INBOX');
+
+          setArchiveResult({
+            archived: totalArchived,
+            scanned: totalScanned,
+            remaining: remaining,
+          });
+
+          await sleep(500);
+          transition('complete');
+        } catch (e) {
+          addLog('error', `Error: ${e.message || 'Unknown error'}`);
+          setError('An error occurred during archiving.');
+        }
+      };
+
+      const handleSignOut = () => {
+        if (accessToken) {
+          google.accounts.oauth2.revoke(accessToken);
+        }
+        accessToken = null;
+        userEmail = '';
+        gapi.client.setToken(null);
+        transition('auth');
+      };
+
+      const renderStep = () => {
+        switch (step) {
+          case 'auth':
+            return (
+              <Box>
+                <AuthScreen onSignIn={handleSignIn} />
+                {loading && <LinearProgress sx={{ mt: 2 }} />}
+                {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
+              </Box>
+            );
+          case 'stats':
+            return stats && <StatsScreen stats={stats} onContinue={() => transition('configure')} />;
+          case 'configure':
+            return (
+              <Box>
+                <ConfigureScreen
+                  rules={rules} setRules={setRules}
+                  cutoffDate={cutoffDate} setCutoffDate={setCutoffDate}
+                  onPreview={handlePreview}
+                />
+                {loading && <LinearProgress sx={{ mt: 2 }} />}
+                {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
+              </Box>
+            );
+          case 'preview':
+            return (
+              <Box>
+                <PreviewScreen
+                  counts={counts} totalCount={totalCount}
+                  rules={rules} cutoffDate={cutoffDate}
+                  onBack={() => transition('configure')}
+                  onArchive={() => setShowConfirm(true)}
+                />
+                <ConfirmDialog
+                  open={showConfirm}
+                  totalCount={totalCount}
+                  onCancel={() => setShowConfirm(false)}
+                  onConfirm={handleArchive}
+                />
+              </Box>
+            );
+          case 'progress':
+            return <ProgressScreen logs={logs} progress={progress} batchStatus={batchStatus} />;
+          case 'complete':
+            return archiveResult && (
+              <CompleteScreen
+                archived={archiveResult.archived}
+                scanned={archiveResult.scanned}
+                remaining={archiveResult.remaining}
+                onRunAgain={() => transition('configure')}
+                onSignOut={handleSignOut}
+              />
+            );
+          default:
+            return null;
+        }
+      };
+
+      return (
+        <ThemeProvider theme={theme}>
+          <CssBaseline />
+          <Box sx={{
+            minHeight: '100vh', display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            p: 2,
+          }}>
+            <Card sx={{ maxWidth: 600, width: '100%', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
+              <CardContent sx={{ p: { xs: 3, sm: 4 } }}>
+                <div className="step-container" style={{ opacity: visible ? 1 : 0 }}>
+                  {renderStep()}
+                </div>
+              </CardContent>
+            </Card>
+          </Box>
+        </ThemeProvider>
+      );
+    }
+
+    // ─── Mount ───────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+
+    // Fade out loading screen, fade in app
+    const ls = document.getElementById('loading-screen');
+    const rt = document.getElementById('root');
+    ls.classList.add('fade-out');
+    rt.classList.add('fade-in');
+    setTimeout(() => { ls.style.display = 'none'; }, 400);
+  </script>
+</body>
+</html>
